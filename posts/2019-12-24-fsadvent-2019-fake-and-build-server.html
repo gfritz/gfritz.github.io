@@ -1,0 +1,323 @@
+<html>
+  <head>
+    <meta charSet="utf-8"></meta>
+    <title>
+      FsAdvent 2019 - Using FAKE in a Build Server
+    </title>
+    <link rel="stylesheet" type="text/css" href="/css/style.css"></link>
+    <link rel="alternate" type="application/atom+xml" href="/feed.xml" title="News Feed"></link>
+  </head>
+  <body>
+    <div class="container">
+      <header class="masthead">
+        <h3 class="masthead-title">
+          <a href="/">
+            Garth Blog
+          </a>
+          <small class="masthead-link">
+            <a href="/archive.html">
+              Archive
+            </a>
+          </small>
+        </h3>
+      </header>
+      <div id="content">
+        <article class="post">
+          <h1 class="post-title">
+            FsAdvent 2019 - Using FAKE in a Build Server
+          </h1>
+          <div class="post-date">
+            12/24/2019
+          </div>
+          <h1>Using FAKE in a Build Server</h1>
+<h2>F# Advent 2019</h2>
+<p>This is a post for <a href="https://sergeytihon.com/2019/11/05/f-advent-calendar-in-english-2019/">F# Advent 2019</a> facilitated by Sergey Tihon. Visit the link to see many more posts about F#.</p>
+<h2>Integrating with TeamCity</h2>
+<p>This article will be TeamCity specific, but there is not much configuration needed to use FAKE.</p>
+<p>In short, configure your build agent to run your FAKE <code>*.fsx</code> script, and have your script pull in build agent variables, like nuget feeds, docker feeds, credentials, build counter, via environment variables.</p>
+<p>Always try to write your scripts to be <a href="https://fake.build/buildserver.html#General-API-usage">build server agnostic</a>. Even isolating a build server specific dependency behind a function is better than not isolating the dependency at all.</p>
+<p>To use FAKE, your build server needs at least one of the following on one or more of its build agents:</p>
+<ul>
+<li>install .NET SDK 2.1+ on your build agent for dotnet tool support, or</li>
+<li>install Docker on your build agent and specify a Dockerfile for your build agent dependencies.</li>
+</ul>
+<p>Add these lines to your build script to integrate with TeamCity:</p>
+<pre><code class="language-fsharp">open Fake.Core
+open Fake.BuildServer
+
+BuildServer.install [ TeamCity.Installer ]
+</code></pre>
+<p>Next, modify your TeamCity configuration:</p>
+<ul>
+<li>Select Runner Type = Command Line,</li>
+<li>Name the step something like &quot;Run FAKE script&quot;, or whatever you like,</li>
+<li>Execute step = &quot;If all previous steps finished successfully&quot;,</li>
+<li>Run = &quot;Custom Script&quot;,</li>
+<li>Custom Scripts = <code>fake build target CIBuild</code>,</li>
+<li>Format stderr output as = &quot;error&quot;,</li>
+<li>Run step within Docker container = &quot;name of the image you built from your dockerfile&quot;:
+<ul>
+<li>Hopefully you have an internal docker registry to host docker images.</li>
+<li>Alternatively, you can choose Runner Type = &quot;Docker&quot; and specify the Dockerfile in your repository, but this will build the dockerfile every time.</li>
+</ul>
+</li>
+</ul>
+<h2>Build Versions and Release Notes</h2>
+<p>My teammates really like this feature of FAKE. We follow the &quot;Complex Format&quot; per the <a href="https://fake.build/apidocs/v5/fake-core-releasenotes.html">FAKE release notes module documentation</a> with one small difference.</p>
+<p>RELEASE_NOTES.md:</p>
+<pre><code class="language-md">// FAKE's complex format
+## New in 1.2.1 (Released 2019/12/24)
+* stuff
+* and things too
+
+// what we do instead
+## 1.2.1 - 24-Dec-2019
+* stuff
+* and things too
+</code></pre>
+<p>The version number of the artifacts are determined from the source code. The build server only provides a number that increments on each build.</p>
+<p>Our build numbers follow the <code>Major.Minor.Patch.Revision</code> format where Major, Minor, and Patch are sourced using the <code>Fake.ReleaseNotes</code> module with a <code>RELEASE_NOTES.md</code> file. The Revision is the TeamCity build counter.</p>
+<p>You can think of the build script as a function that takes in an argument for <code>Revision</code> and assumes it runs in a git repository. Note that anything could provide the <code>Revision</code> argument, but the build script will load that from an environment variable.</p>
+<p>If you want to overly simplify a build script to a function, this is close-ish:</p>
+<pre><code class="language-fsharp">FileSystem -&gt; DockerFeedConnection -&gt; NugetFeedConnection -&gt; RevisionNumber  -&gt; unit
+</code></pre>
+<h2>NuGet Packages</h2>
+<pre><code class="language-fsharp">// testTask.IfNeeded means THIS task should run after
+let nugetPackTask = BuildTask.create &quot;Artifact&quot; [ testTask.IfNeeded ] {
+
+    let nugetPackDefaults = fun (options : NuGet.NuGetParams) -&gt;
+        // tool path is by default ./tools/ or you can change it with Tools = &quot;/path/to/nuget.exe&quot;
+        { options with
+            Publish = true
+            PublishUrl = &quot;https://artifacts.company.com/api/nuget/v3/&quot;
+            // https://fake.build/dotnet-nuget.html#Creating-a-nuspec-template
+            // replace placeholders in .nuspec with `NuGetParams` record field
+            Version = EV.version()
+            Authors = authors
+            Summary = &quot;A super cool dotnet core application.&quot;
+            Description = &quot;A longer description about this super cool dotnet core application.&quot;
+            ReleaseNotes = release().Notes |&gt; String.toLines
+            // FS0052 workaround (ugly: let x = ... in x); this is a shorthand to make an intermediate value
+            Copyright = sprintf &quot;Your Company %i&quot; (let now = System.DateTime.UtcNow in now.Year)
+            Tags = &quot;C#;F#;FAKE;&quot;
+            Files = [   // projects deploying to kubernetes should insert their own yml file,
+                        // but these files should always be packaged
+                        &quot;fake.cmd&quot;, Some &quot;content&quot;, None
+                        &quot;fake.sh&quot;, Some &quot;content&quot;, None
+                        &quot;deploy.fsx&quot;, Some &quot;content&quot;, None
+                        &quot;paket.dependencies&quot;, Some &quot;content&quot;, None
+                        &quot;paket.lock&quot;, Some &quot;content&quot;, None ]
+            // set paths for NuGet
+            OutputPath = artifactOutDir
+            WorkingDir = buildOutDir
+            BasePath = Some root }
+
+    let packApi () =
+        // take the nuget pack defaults and apply API specific nuget pack settings
+        NuGet.NuGet (nugetPackDefaults &gt;&gt; ApiProject.nugetPackSettings) &quot;.nuspec&quot;
+
+    // now pack them all (could async parallel this later)
+    packApi ()
+}
+</code></pre>
+<p>If you noticed <code>ApiProject.nugetPackSettings</code>, I like to put all functions, values, paths, and names specific for a project into a project specific module in the build script.</p>
+<h2>Docker Images</h2>
+<pre><code class="language-fsharp">//
+// Helpers
+//
+
+/// Look for the specified `tool` on the Environment's PATH and in `otherSearchFolders`.
+/// - `tool` : name of the tool on a *nix system
+/// - `winTool` : name of the executable on a windows system
+let platformTool tool winTool otherSearchFolders =
+    let tool = if Environment.isLinux then tool else winTool
+    tool
+    |&gt; ProcessUtils.tryFindFileOnPath
+    |&gt; function
+        | Some pathTool -&gt; pathTool
+        | None -&gt;
+            if Seq.isEmpty otherSearchFolders then
+                failwithf &quot;platformTool %s not found&quot; tool
+            else
+                ProcessUtils.tryFindFile otherSearchFolders tool
+                |&gt; function
+                    | Some folderTool -&gt; folderTool
+                    | None -&gt; failwithf &quot;folderTool %s not found in folders %A&quot; tool otherSearchFolders
+
+let dockerTool =
+    // you should have it installed on your development machine
+    // we assume docker is included in the build agent path too
+    platformTool &quot;docker&quot; &quot;docker.exe&quot; Seq.empty
+
+let buildDocker repositoryUrl tag =
+    let args = sprintf &quot;build -t %s .&quot; (repositoryUrl &lt;/&gt; tag)
+    runTool &quot;docker&quot; args &quot;.&quot;
+
+let pushDocker repositoryUrl tag =
+    let args = sprintf &quot;push %s&quot; (repositoryUrl &lt;/&gt; tag)
+    runTool &quot;docker&quot; args &quot;.&quot;
+
+let dockerUser = &quot;yourcompany-user&quot;
+let dockerImageName = &quot;yourcompany-api&quot;
+let dockerFullName = sprintf &quot;%s/%s:%s&quot; dockerUser dockerImageName (EV.buildVersion())
+
+let dockerBuildTask = BuildTask.create &quot;DockerBuild&quot; [] {
+    buildDocker Docker.repositoryUrl dockerFullName
+}
+// publish the docker image
+let dockerBuildTask = BuildTask.create &quot;DockerPush&quot; [dockerBuildTask] {
+    pushDocker Docker.repositoryUrl dockerFullName
+}
+
+</code></pre>
+<h2>Stringly vs Strongly Typed Build Targets</h2>
+<h3>Stringly Typed</h3>
+<p>FAKE by default has you define build targets like so:</p>
+<pre><code class="language-fsharp">open Fake.Core
+
+Target.initializeEnvironment()
+
+// define targets
+Target.create &quot;Test&quot; (fun _ -&gt;
+    // run dotnet test, or whatever
+)
+Target.create &quot;Publish&quot; (fun _ -&gt;
+    // run dotnet publish
+)
+Target.create &quot;Default&quot; (fun _ -&gt;
+    // an empty task for default build behavior on a developer machine
+)
+Target.create &quot;CI&quot; (fun _ -&gt;
+    // an empty task for the CI server to enter the CI specific build target ordering
+)
+
+// define ordering
+&quot;Test&quot;
+==&gt; &quot;Default&quot;
+
+&quot;Default&quot;
+==&gt; &quot;Publish&quot;
+==&gt; &quot;CI&quot;
+
+// if you run `fake build`, then &quot;Default&quot; will be the starting target
+Target.runOrDefault &quot;Default&quot;
+
+</code></pre>
+<h3>Strongly Typed</h3>
+<p><a href="https://blog.vbfox.net/2018/09/12/fake-typed-targets.html">vbfox</a> created a FAKE 5 module for <a href="https://github.com/vbfox/FoxSharp/tree/master/src/BlackFox.Fake.BuildTask">strongly-typed targets</a> that allows scripts to define let-bound values that represent build tasks, and the compiler will be able to check the usage of those targets like any other normal value.</p>
+<p>I use <code>BlackFox.Fake</code>, but I miss the summary-like expression listing the order of build targets. For example:</p>
+<pre><code class="language-fsharp">//// Fake.Core.Target
+
+// define targets
+Target.create &quot;Clean&quot; ()
+Target.create &quot;Test&quot; ()
+Target.create &quot;Publish&quot; ()
+Target.create &quot;CI&quot; ()
+
+// define ordering
+&quot;Clean&quot;
+==&gt; &quot;Test&quot;
+==&gt; &quot;Publish&quot;
+
+&quot;Publish&quot;
+==&gt; &quot;CI&quot;
+
+//// BlackFox.Fake.BuildTask
+
+let cleanTask = BuildTask.create &quot;Clean&quot; [] { (* *) }
+let testTask = BuildTask.create &quot;Test&quot; [clean.IfNeeded] { (* *) }
+let publishTask = BuildTask.create &quot;Publish&quot; [testTask] { (* *) }
+let ciTask = BuildTask.create &quot;CI&quot; [publishTask] { (* *) }
+</code></pre>
+<p>I do not have a clear preference or advice on what to choose over the other. I suggest trying for yourself. My day-to-day build target order is not complicated enough to show a clear difference.</p>
+<h2>Creating Octopus Releases</h2>
+<p>If you use something other than Octopus, chances are your deployment server has a REST API to create and deploy releases.</p>
+<pre><code class="language-fsharp">
+let projectName = &quot;Some Service&quot;
+
+module DeploymentServer =
+
+    module private EnvironmentVariables =
+        let server = Environment.environVar &quot;Octopus-Server&quot;
+        let apiKey = Environment.environVar &quot;Octopus-TeamCityAPIKey&quot;
+
+    [&lt;AutoOpen&gt;]
+    module private Helpers =
+        // when Fake.Tools.Octo nuget package works with dotnet tool Octopus.DotNet.Cli, use Fake.Octo instead
+        let octoTool cmd args =
+            dotnetTool (sprintf &quot;octo %s %s --server=%s --apikey=%s&quot; cmd args EnvironmentVariables.server EnvironmentVariables.apiKey) &quot;.&quot;
+
+    let private createReleaseArgs =
+        // Using triple quotes to allow for quote characters in the format string, also could have escaped with backslash.
+        // Re-use your release notes so you see them in the octopus release screen.
+        sprintf &quot;&quot;&quot;--package=*:%s --project=&quot;%s&quot; --version=&quot;%s&quot; --releasenotesfile=&quot;%s&quot; &quot;&quot;&quot; buildNumber projectName buildNumber releaseNotesFile
+
+    /// Creates a release in Octopus for this build
+    let createRelease _ =
+        // dotnet tool update will: 1. install if not installed, 2. same version installed, reinstall it, 3. update lower version to current version
+        // This is nice because we do not have to check if the tool is already installed and conditionally NOT run `dotnet tool install` if it is. Install fails if the tool is already installed.
+        // https://github.com/dotnet/cli/pull/10205#issuecomment-506847148
+        dotnetTool &quot;tool update -g Octopus.DotNet.Cli&quot; &quot;.&quot;
+        octoTool &quot;create-release&quot; createReleaseArgs
+
+// make sure when this task runs that any nuget packages, docker images, etc. are already published
+BuildTask.create &quot;CreateRelease&quot; [yourNugetPublishTask; yourDockerPublishTask] {
+    DeploymentServer.createRelease
+}
+</code></pre>
+<h2>VS Code Dev Containers</h2>
+<p>A good way to shorten the feedback loop on your Dockerfile defining your build dependencies is to use that Dockerfile locally. VS Code's Dev Container feature makes that really easy provided you have Docker and VS Code installed.</p>
+<p>I have two unsolved-by-me, but manageable, problems with this approach:</p>
+<ul>
+<li>.fake/ cache sometimes picks up as &quot;invalid&quot; so I have to purge the directory and download dependencies again</li>
+<li>paket-files/ sometimes experiences the same behavior as .fake/</li>
+</ul>
+<p>I may have done something wrong with my Dockerfile/fake/paket combination. I have not investigated much because this problem does not happen often enough to waste time.</p>
+<pre><code class="language-dockerfile">##
+## want dotnet-sdk to use dotnet-tool and run the build script with dotnet-fake
+##
+FROM mcr.microsoft.com/dotnet/core/sdk:3.0-alpine
+RUN apk update
+# add dotnet tools to path to pick up fake and paket installation
+ENV PATH=&quot;${PATH}:/root/.dotnet/tools&quot;
+# install dotnet tools for fake, paket, octopus
+RUN    dotnet tool install -g fake-cli \
+    &amp;&amp; dotnet tool install -g paket \
+# https://octopus.com/docs/octopus-rest-api/octo.exe-command-line/install-global-tool
+    &amp;&amp; dotnet tool install -g Octopus.DotNet.Cli \
+# install yarn
+    &amp;&amp; apk add yarn \
+# install docker cli; note the build server will have to provide the actual docker engine
+    &amp;&amp; apk add docker \
+# other tools expected by build.*.fsx scripts
+    &amp;&amp; apk add git curl
+# bring in the build scripts and build script dependencies files
+COPY build.standalone.fsx build.webcomponents.fsx paket.dependencies paket.lock /var/app/
+COPY .paket /var/app/.paket/WORKDIR /var/app
+</code></pre>
+<p>I publish this image to our docker registry my teammates and the build server do not need to rebuild the image every time.</p>
+<h2>FAKE and Build Servers</h2>
+<p>Try to write build scripts to be build server agnostic.</p>
+<p>While we do not change our build server, we gain the ability to treat our build process as just another segment of code to branch, peer review, and run. I think this is much easier than using pre-defined steps and templates defined in your build server of choice.</p>
+<h2>Links, Inspiration, and Contact</h2>
+<p>View the other <a href="https://sergeytihon.com/2019/11/05/f-advent-calendar-in-english-2019/">F# Advent 2019 posts</a>!</p>
+<p>Links:</p>
+<ul>
+<li><a href="https://fake.build/">FAKE</a></li>
+<li><a href="https://github.com/vbfox/FoxSharp/tree/master/src/BlackFox.Fake.BuildTask">BlackFox.Fake.BuildTask</a></li>
+<li><a href="https://code.visualstudio.com/docs/remote/containers#_getting-started">VS Code Dev Containers - Getting Started</a></li>
+</ul>
+<p>Inspiration:</p>
+<p>I often reviewed these repositories to see how they used FAKE.</p>
+<ul>
+<li><a href="https://github.com/ionide/ionide-vscode-fsharp">Ionide</a></li>
+<li><a href="https://github.com/SAFE-Stack/SAFE-BookStore">SAFE Stack BookStore</a></li>
+</ul>
+<p>Contact:</p>
+<p>I do not have a comments section, so please use <a href="https://twitter.com/garthfritz/">@garthfritz on Twitter</a> or <code>@garth</code> on the <a href="https://fsharp.org/guides/slack/">F# Software Foundation Slack</a> to contact me with feedback or clarification.</p>
+
+        </article>
+      </div>
+    </div>
+  </body>
+</html>
